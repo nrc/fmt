@@ -16,7 +16,7 @@ impl<'a> FmtEngine<'a> {
     pub fn new(text: &'a str) -> FmtEngine<'a> {
         FmtEngine {
             config: Config::default(),
-            root: Node { label: None, text: text, kind: NodeKind::Item(ItemNode::new(RuleSet::empty())) },
+            root: Node { label: None, text: text, kind: NodeKind::List(ListNode::new(RuleSet::empty(), Separator::None)) },
         }
     }
 
@@ -37,36 +37,10 @@ impl<'a> FmtEngine<'a> {
                 Separator::LineBreak => Ok("\n".to_owned()),
             },
             NodeKind::Word | NodeKind::Snippet => Ok(node.text.to_owned()),
-            NodeKind::Item(ref item) => {
-                if item.rules.rules.is_empty() {
-                    //println!("rule free - `{}`", node.text);
-                    // Rule-free rendering - render each element in turn.
-                    let mut result = String::new();
-                    for element in &item.elements {
-                        // TODO compute new shape for each iteration
-                        result.push_str(&self.reflow_node(element, &[], shape)?);
-                    }
-                    return Ok(result);
-                }
-                for rule in &item.rules.rules {
-                    if !self.rule_applies(rule, node, args) {
-                        continue;
-                    }
-                    let result = self.reflow_item_node_with_rule(item, rule, args, shape);
-                    if result.is_err() {
-                        continue;
-                    }
-                    //println!("applied {:?}: `{}`", rule, result.as_ref().unwrap());
-                    return result;
-                }
-
-                // No matching rules.
-                Err(())
-            }
             NodeKind::List(ref list) => {
-                // TODO DRY
                 if list.rules.rules.is_empty() {
                     // Rule-free rendering - render each element in turn.
+                    //println!("rule free - `{}`", node.text);
                     let mut result = String::new();
                     for element in &list.elements {
                         // TODO compute new shape for each iteration
@@ -82,6 +56,7 @@ impl<'a> FmtEngine<'a> {
                     if result.is_err() {
                         continue;
                     }
+                    //println!("applied {:?}: `{}`", rule, result.as_ref().unwrap());
                     return result;
                 }
 
@@ -139,14 +114,6 @@ impl<'a> FmtEngine<'a> {
 
     fn eval_prop(&self, node: &Node, prop_name: &'static str) -> Option<usize> {
         match node.kind {
-            NodeKind::Item(ref item) => {
-                for prop in &item.rules.props {
-                    if prop_name == prop.name {
-                        return Some(self.eval_prop_kind(node, &prop.kind));
-                    }
-                }
-                None
-            }
             NodeKind::List(ref list) => {
                 for prop in &list.rules.props {
                     if prop_name == prop.name {
@@ -178,11 +145,6 @@ impl<'a> FmtEngine<'a> {
             }
 
             match cur_node.kind {
-                NodeKind::Item(ref item) => {
-                    for element in &item.elements {
-                        queue.push_back(element);
-                    }
-                }
                 NodeKind::List(ref list) => {
                     for element in &list.elements {
                         queue.push_back(element);
@@ -196,47 +158,7 @@ impl<'a> FmtEngine<'a> {
     }
 
     // Assumes that all the conditions of rule have been met.
-    fn reflow_item_node_with_rule(&self, node: &ItemNode, rule: &Rule, args: &[Arg], shape: &Shape) -> Result<String, ()> {
-        // TODO
-        // PassArg(&'static str, &'static str, usize),
-        // InsertAfter(&'static str, &'static str),
-        // InsertBefore(&'static str, &'static str),
-        // With(&'static str, Action)
-
-        let mut effects = HashMap::new();
-        for effect in &rule.effects {
-            effects.insert(effect.target, effect.kind.clone());
-        }
-
-        let mut result = String::new();
-        for element in &node.elements {
-            let effect = effects.get(element.text).map(|e| e.clone());
-            let effect = effect.or_else(|| element.label.and_then(|l| effects.get(l).map(|e| e.clone())));
-
-            if let Some(EffectKind::PassArg(..)) = effect {
-                // TODO modify args
-            }
-
-            if let Some(EffectKind::InsertBefore(s)) = effect {
-                result.push_str(s);
-            }
-
-            // TODO shape
-            let node_str = self.reflow_node(element, args, shape)?;
-            result.push_str(&node_str);
-
-            if let Some(EffectKind::InsertAfter(s)) = effect {
-                result.push_str(s);
-            }
-
-            // TODO With effect
-        }
-
-        Ok(result)
-    }
-
     fn reflow_list_node_with_rule(&self, node: &ListNode, rule: &Rule, args: &[Arg], shape: &Shape) -> Result<String, ()> {
-        // TODO copied from above
         let mut effects = HashMap::new();
         for effect in &rule.effects {
             effects.insert(effect.target, effect.kind.clone());
@@ -282,26 +204,11 @@ pub struct Node<'b> {
 
 #[derive(Debug)]
 enum NodeKind<'b> {
-    Item(ItemNode<'b>),
+    // TODO rename
     List(ListNode<'b>),
     Separator(Separator),
     Word,
     Snippet,
-}
-
-#[derive(Debug)]
-struct ItemNode<'b> {
-    rules: Rc<RuleSet>,
-    elements: Vec<Node<'b>>,
-}
-
-impl<'b> ItemNode<'b> {
-    fn new(rules: Rc<RuleSet>) -> ItemNode<'b> {
-        ItemNode {
-            rules: rules,
-            elements: vec![],
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -367,7 +274,7 @@ impl<'b> Node<'b> {
     pub fn item<'a>(&'a mut self, rules: Rc<RuleSet>, text: &'b str) -> NodeGuard<'a, 'b> {
         NodeGuard {
             parent: self,
-            node: Some(Box::new(Node { label: None, text: text, kind: NodeKind::Item(ItemNode::new(rules)) })),
+            node: Some(Box::new(Node { label: None, text: text, kind: NodeKind::List(ListNode::new(rules, Separator::None)) })),
         }
     }
 
@@ -391,39 +298,28 @@ impl<'b> Node<'b> {
             return;
         }
 
-        let elements = match self.kind {
-            NodeKind::Item(ref mut item) => {
-                &mut item.elements
-            }
+        match self.kind {
             NodeKind::List(ref mut list) => {
-                &mut list.elements
+                let node = Node { label: None, text: text, kind: NodeKind::Word };
+                list.elements.push(node);
             }
             _ => panic!("Pushing word to atomic node"),
-        };
-
-        let node = Node { label: None, text: text, kind: NodeKind::Word };
-        elements.push(node);
+        }
     }
 
     pub fn space<'a>(&'a mut self, sep: Separator) {
-        let elements = match self.kind {
-            NodeKind::Item(ref mut item) => {
-                &mut item.elements
-            }
+        match self.kind {
             NodeKind::List(ref mut list) => {
-                &mut list.elements
+                let node = Node { label: None, text: " ", kind: NodeKind::Separator(sep) };
+                list.elements.push(node);
             }
             _ => panic!("Pushing spacer to atomic node"),
-        };
-
-        let node = Node { label: None, text: " ", kind: NodeKind::Separator(sep) };
-        elements.push(node);
+        }
     }
 
     pub fn snippet<'a>(&'a mut self, text: &'b str) {
         let node = Node { label: None, text: text, kind: NodeKind::Snippet };
         match self.kind {
-            NodeKind::Item(ref mut item) => item.elements.push(node),
             NodeKind::List(ref mut list) => list.elements.push(node),
             _ => panic!("Pushing snippet to atomic node"),
         }
@@ -431,7 +327,6 @@ impl<'b> Node<'b> {
 
     pub fn pop_node(&mut self, node: Node<'b>) {
         match self.kind {
-            NodeKind::Item(ref mut item) => item.elements.push(node),
             NodeKind::List(ref mut list) => list.elements.push(node),
             _ => panic!("pop_node on atomic node"),
         }
