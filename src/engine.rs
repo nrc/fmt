@@ -27,9 +27,19 @@ impl<'a> FmtEngine<'a> {
     // TODO take inherited effects
     fn reflow_node(&self, node: &Node<'a>, args: &[Arg], shape: &Shape) -> Result<String, ()> {
         match node.kind {
+            NodeKind::Separator(sep) => match sep {
+                Separator::None => Ok("".to_owned()),
+                // TODO should we have a space after the comma?
+                Separator::Comma => Ok(",".to_owned()),
+                Separator::Space => Ok(" ".to_owned()),
+                // TODO break?
+                Separator::SpaceOrLineBreak => Ok(" ".to_owned()),
+                Separator::LineBreak => Ok("\n".to_owned()),
+            },
             NodeKind::Word | NodeKind::Snippet => Ok(node.text.to_owned()),
             NodeKind::Item(ref item) => {
                 if item.rules.rules.is_empty() {
+                    //println!("rule free - `{}`", node.text);
                     // Rule-free rendering - render each element in turn.
                     let mut result = String::new();
                     for element in &item.elements {
@@ -46,6 +56,7 @@ impl<'a> FmtEngine<'a> {
                     if result.is_err() {
                         continue;
                     }
+                    //println!("applied {:?}: `{}`", rule, result.as_ref().unwrap());
                     return result;
                 }
 
@@ -145,7 +156,7 @@ impl<'a> FmtEngine<'a> {
                 None                
             }
             NodeKind::Snippet => Some(0),
-            NodeKind::Word => None,
+            NodeKind::Word | NodeKind::Separator(_) => None,
         }
     }
 
@@ -199,10 +210,26 @@ impl<'a> FmtEngine<'a> {
 
         let mut result = String::new();
         for element in &node.elements {
-            // TODO effects
+            let effect = effects.get(element.text).map(|e| e.clone());
+            let effect = effect.or_else(|| element.label.and_then(|l| effects.get(l).map(|e| e.clone())));
+
+            if let Some(EffectKind::PassArg(..)) = effect {
+                // TODO modify args
+            }
+
+            if let Some(EffectKind::InsertBefore(s)) = effect {
+                result.push_str(s);
+            }
+
             // TODO shape
             let node_str = self.reflow_node(element, args, shape)?;
             result.push_str(&node_str);
+
+            if let Some(EffectKind::InsertAfter(s)) = effect {
+                result.push_str(s);
+            }
+
+            // TODO With effect
         }
 
         Ok(result)
@@ -217,10 +244,26 @@ impl<'a> FmtEngine<'a> {
 
         let mut result = String::new();
         for element in &node.elements {
-            // TODO effects
+            let effect = effects.get(element.text).map(|e| e.clone());
+            let effect = effect.or_else(|| element.label.and_then(|l| effects.get(l).map(|e| e.clone())));
+
+            if let Some(EffectKind::PassArg(..)) = effect {
+                // TODO modify args
+            }
+
+            if let Some(EffectKind::InsertBefore(s)) = effect {
+                result.push_str(s);
+            }
+
             // TODO shape
             let node_str = self.reflow_node(element, args, shape)?;
             result.push_str(&node_str);
+
+            if let Some(EffectKind::InsertAfter(s)) = effect {
+                result.push_str(s);
+            }
+
+            // TODO With effect
         }
 
         Ok(result)
@@ -241,6 +284,7 @@ pub struct Node<'b> {
 enum NodeKind<'b> {
     Item(ItemNode<'b>),
     List(ListNode<'b>),
+    Separator(Separator),
     Word,
     Snippet,
 }
@@ -341,14 +385,39 @@ impl<'b> Node<'b> {
         }
     }
 
-    // TODO when pushing a node, we should insert default spacer.
     pub fn word<'a>(&'a mut self, text: &'b str) {
-        let node = Node { label: None, text: text, kind: NodeKind::Word };
-        match self.kind {
-            NodeKind::Item(ref mut item) => item.elements.push(node),
-            NodeKind::List(ref mut list) => list.elements.push(node),
-            _ => panic!("Pushing word to atomic node"),
+        if text.is_empty() {
+            // TODO maybe warn here
+            return;
         }
+
+        let elements = match self.kind {
+            NodeKind::Item(ref mut item) => {
+                &mut item.elements
+            }
+            NodeKind::List(ref mut list) => {
+                &mut list.elements
+            }
+            _ => panic!("Pushing word to atomic node"),
+        };
+
+        let node = Node { label: None, text: text, kind: NodeKind::Word };
+        elements.push(node);
+    }
+
+    pub fn space<'a>(&'a mut self, sep: Separator) {
+        let elements = match self.kind {
+            NodeKind::Item(ref mut item) => {
+                &mut item.elements
+            }
+            NodeKind::List(ref mut list) => {
+                &mut list.elements
+            }
+            _ => panic!("Pushing spacer to atomic node"),
+        };
+
+        let node = Node { label: None, text: " ", kind: NodeKind::Separator(sep) };
+        elements.push(node);
     }
 
     pub fn snippet<'a>(&'a mut self, text: &'b str) {
@@ -558,6 +627,7 @@ mod test {
         {
             let mut node = engine.root.item(RuleSet::empty(), "fn foo() { bar(); }");
             node.word("fn");
+            node.space(Separator::Space);
             node.word("foo");
             {
                 let mut args = node.item(RuleSet::empty(), "()");
@@ -565,6 +635,7 @@ mod test {
                 args.list(arg_list_rules(), Separator::Comma, "");
                 args.word(")");
             }
+            node.space(Separator::Space);
             {
                 let mut body = node.item(block_rules(), "{ bar(); }");
                 body.word("{");
@@ -586,10 +657,12 @@ mod test {
     fn block_rules() -> Rc<RuleSet> {
         let mut rules = vec![];
 
+        // Empty block.
         let mut rule = Rule::empty();
         rule.conditions.push(Condition::Fn(Box::new(Condition::Query("stmt_list", "len")), Box::new(|l| if l == 0 { 1 } else { 0 })));
         rules.push(rule);
 
+        // One-line (short) block.
         let mut rule = Rule::empty();
         rule.conditions.push(Condition::Query("stmt_list", "is_short"));
         // TODO this is not the right way to solve this. We should permit influencing the shape for formatting, and have a shape constrained by width + max of single line
@@ -598,6 +671,7 @@ mod test {
         rule.effects.push(Effect::insert_before("}", " "));
         rules.push(rule);
 
+        // Regular block.
         let mut rule = Rule::empty();
         rule.effects.push(Effect::insert_after("{", "\n"));
         rule.effects.push(Effect::with("stmt_list", Action::BlockIndent));
